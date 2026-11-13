@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tciqaoa"
+version = "0.1.0"
+description = "Tensor Cross Interpolation (xfacpy) meets QAOA: TCI angle search and TCI on the bitstring landscape, benchmarked against hybridq"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Faluke Aikebaier" }]
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+# NOTE: xfacpy is required for optimize_tci / tci_minimize_bits but is NOT on PyPI.
+# Build it from https://github.com/tensor4all/xfac and put build/python on PYTHONPATH.
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["tciqaoa*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

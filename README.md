@@ -5,7 +5,7 @@ benchmarked against [hybridq](https://github.com/Faluke-Aikebaier/QAOA-inspired-
 and classical QUBO solvers.**
 
 > **Bottom line:** TCI does not beat QAOA; it is a deterministic, reusable first stage
-> for it. See [Conclusions](#conclusions), and [Using it on your own QUBO](#using-it-on-your-own-qubo)
+> for it. See [Conclusions](#conclusions), and [Four problem interfaces](#four-problem-interfaces)
 > for the entry points with TCI on or off.
 >
 > **Status:** research code with honest benchmarks. Short version: TCI learns the
@@ -130,6 +130,273 @@ Companion repos: [tci-optimizer](https://github.com/Faluke-Aikebaier/tci-optimiz
 (TCI for continuous global optimisation) and
 [QAOA-inspired-optimisation](https://github.com/Faluke-Aikebaier/QAOA-inspired-optimisation)
 (`hybridq`: simulated bifurcation and simulated quantum annealing).
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Faluke-Aikebaier/tci-qaoa.git && cd tci-qaoa
+pip install -e .            # numpy, scipy
+# xfacpy is not on PyPI; build it (needed for tci=True only):
+git clone https://github.com/tensor4all/xfac.git
+cmake -S xfac -B xfac/build -D CMAKE_BUILD_TYPE=Release -D XFAC_BUILD_PYTHON=ON
+cmake --build xfac/build -j 4
+export PYTHONPATH="$PWD/xfac/build/python:$PYTHONPATH"
+```
+
+Everything with `tci=False` (the QAOA simulator and the baseline optimisers) works
+without xfacpy.
+
+---
+
+## Quick start
+
+Every solver takes `tci=True` or `tci=False`. With `tci=False` it runs the same
+pipeline with the TCI stage replaced by the baseline TCI was benchmarked against, so
+the two can be compared directly.
+
+```python
+import numpy as np
+from tciqaoa import (solve_qubo, solve_maxcut, solve_portfolio,
+                     random_qubo, random_graph, portfolio_data)
+
+# ── Raw QUBO: minimise x^T Q x, QAOA at depth 2 ──────────────────────
+Q   = random_qubo(12, seed=3)
+res = solve_qubo(Q, p=2, tci=False)          # tci=True: same pipeline, TCI first stage
+print(res["report"]["best_sampled_x"])       # [1. 1. 0. 1. 1. 1. 0. 1. 1. 0. 1. 1.]
+print(res["report"]["best_sampled_energy"])  # -12.4285  (the exact optimum)
+print(res["n_evals"])                        # 1,550 circuit runs
+
+# ── MaxCut on a random graph ─────────────────────────────────────────
+A   = random_graph(12, edge_prob=0.4, seed=3)
+res = solve_maxcut(A, p=2, tci=False)
+print(f"Cut: {res['cut_value']:.0f} / {res['n_edges']} edges")   # Cut: 18 / 23 edges
+
+# ── Portfolio: select 4 of 12 assets ─────────────────────────────────
+mu, sigma = portfolio_data(12, seed=2)
+res = solve_portfolio(mu, sigma, k=4, p=2, tci=False, risk_aversion=0.5)
+print(res["selected_assets"], f"Sharpe {res['sharpe']:.3f}")     # [ 3  4  6 10] Sharpe 0.737
+
+# ── Efficient frontier: 32 risk aversions, one tensor train (TCI pays here) ──
+fr = solve_portfolio(mu, sigma, k=4, p=1, tci=True, risk_aversion=(0.0, 1.0), nt=32)
+for pt in fr["frontier"][::8]:
+    print(f"lambda {pt['risk_aversion']:.2f}: {pt['selected_assets']}  "
+          f"return {pt['expected_return']:.3f}  variance {pt['variance']:.3f}")
+print(fr["n_evals"])                         # 15,903 circuit runs; tci=False: 27,714
+# lambda 0.00: [2 4 6 8]  return 0.691  variance 6.298
+# lambda 0.26: [ 3  4  6 10]  return 0.602  variance 0.668
+# lambda 0.52: [ 3  4  6 10]  return 0.602  variance 0.668
+# lambda 0.77: [ 3  4  6 11]  return 0.556  variance 0.333
+```
+
+QAOA returns a quantum state, not a bitstring: every solver reads its answer off as
+the best of `shots` (default 4,096) bitstrings sampled from the optimised circuit, and
+reports P(ground) so you can see how likely that is to be the optimum. At low depth
+P(ground) can be small (0.1% for the portfolio above at p = 2), so raise `shots` or `p`
+if the answer must be the exact optimum.
+
+---
+
+## Four problem interfaces
+
+| | problem | TCI on: what TCI does | TCI off: the baseline | when TCI pays |
+|---|---|---|---|---|
+| `solve_qubo` | any QUBO, one instance | p = 1: a tensor train over the angle box (`optimize_tci`). p ≥ 2: the depth chain whose first stage is a TT and a TCI sampler | p = 1: INTERP (5 restarts). p ≥ 2: the same chain seeded by random restarts | rarely: on one instance `tci=False` is as good and cheaper |
+| `solve_maxcut` | MaxCut on a graph | as `solve_qubo` | as `solve_qubo` | as `solve_qubo` |
+| `solve_portfolio` | pick k of n assets; or a whole efficient frontier | one portfolio: as `solve_qubo`. Frontier: one TT over (angles × risk aversion) for every λ | INTERP at each λ (p = 1), or the chain seeded by random restarts (p ≥ 2) | for frontiers of ~32+ points: 1.7–1.8× fewer circuit runs at p = 1 |
+| `solve_family` | any family of QUBOs Q(t₁, .., t_k) at many parameter points | one TT over (angles × t₁ .. t_k), and the depth chain built on it | as for the frontier | many points (~64+), or p ≥ 2 with few seeding points (`n_anchors`) |
+
+QAOA is simulated exactly as a 2ⁿ statevector, so all four need n ≲ 22. Every result
+carries `n_evals`, the circuit runs used, so TCI on and off can be compared on cost.
+See [Conclusions](#conclusions) for the evidence behind the last column.
+
+The tensor train is built with `angle_pivots=4`: the build also starts from 4 × 4
+points spread over the angle box. Without them it can converge early around one basin;
+on a portfolio family with the default budget penalty it stopped at rank 4 after 224
+runs and missed the optimum at every point. With them it reaches rank 11 after 1.9k
+runs and matches INTERP at all 32 points, for 2.1× fewer circuit runs in total. The
+benchmarks below were run without this option (`tci_sweep`'s default,
+`angle_pivots=0`).
+
+### `solve_qubo` — Raw QUBO
+
+Minimises E(x) = xᵀQx over x ∈ {0, 1}ⁿ. Linear terms go on the diagonal (xᵢ² = xᵢ);
+Q need not be symmetric.
+
+```python
+from tciqaoa import solve_qubo
+
+res = solve_qubo(
+    Q              = Q,      # (n, n) QUBO matrix, n <= ~22
+    p              = 2,      # QAOA depth
+    tci            = True,   # True / False (or "on" / "off")
+    extra_restarts = 8,      # p >= 3: random restarts per depth in the chain
+    angle_pivots   = 4,      # TT build: also start from 4 x 4 points over the angle box
+    shots          = 4096,   # bitstrings sampled for the read-out
+    seed           = 0,
+)
+
+res["angles"]    # optimal (gamma_1 .. gamma_p, beta_1 .. beta_p)
+res["cost"]      # optimised <C> (normalised: mean 0, std 1 over all bitstrings)
+res["n_evals"]   # circuit runs used (including the TT build)
+res["tci"]       # whether TCI was used
+res["report"]    # dict: best_sampled_x, best_sampled_energy, approx_ratio,
+                 #       p_ground, expected_energy, shots
+```
+
+### `solve_maxcut` — Graph partitioning
+
+Splits the nodes into two sets to maximise the number of cut edges, with the QUBO
+Q = −(D − A) (as in hybridq).
+
+```python
+from tciqaoa import solve_maxcut
+
+res = solve_maxcut(
+    A     = A,       # (n, n) symmetric adjacency matrix (weights allowed)
+    p     = 2,
+    tci   = False,
+    shots = 4096,
+    seed  = 0,
+)
+
+res["partition"]     # 0/1 per node, shape (n,)
+res["cut_value"]     # (weighted) number of cut edges
+res["n_edges"]       # edges in the graph
+res["approx_ratio"]  # of the expected cut: 1 = every shot is a maximum cut
+res["p_ground"]      # probability of sampling a maximum cut
+res["angles"], res["n_evals"], res["tci"]
+```
+
+### `solve_portfolio` — Asset selection and efficient frontiers
+
+Selects exactly k of n assets with the Markowitz QUBO
+λ·Σ − diag(μ / max μ) + A·(Σᵢxᵢ − k)² (`portfolio_qubo`; the budget penalty A defaults
+to a value that keeps every local minimum at exactly k assets).
+
+```python
+from tciqaoa import solve_portfolio
+
+res = solve_portfolio(
+    mu            = mu,      # (n,) expected returns
+    sigma         = sigma,   # (n, n) covariance matrix
+    k             = 4,       # number of assets to select
+    p             = 2,
+    tci           = False,
+    risk_aversion = 0.5,     # lambda; or (lo, hi) for a frontier, see below
+    penalty       = None,    # budget penalty A (None: safe default)
+    shots         = 4096,
+    seed          = 0,
+)
+
+res["selected_assets"]   # indices of the chosen assets
+res["expected_return"]   # mu . x
+res["variance"]          # x^T Sigma x
+res["sharpe"]            # return / sqrt(variance)
+res["feasible"]          # exactly k assets?
+res["approx_ratio"], res["p_ground"], res["angles"], res["n_evals"], res["tci"]
+```
+
+**Efficient frontier:** pass `risk_aversion=(lo, hi)` and `nt` (a divisor of 32: 4, 8,
+16 or 32 evenly spaced values from lo to hi). With `tci=True` one tensor train over
+(angles × risk aversion) serves every λ; this is where TCI saves circuit runs.
+
+```python
+for tci in (True, False):
+    fr = solve_portfolio(mu, sigma, k=4, p=1, tci=tci, risk_aversion=(0.0, 1.0), nt=32)
+    print(tci, fr["n_evals"])            # True 15,903 / False 27,714 circuit runs
+
+fr["frontier"]   # one dict per lambda: risk_aversion, selected_assets, expected_return,
+                 #                      variance, sharpe, feasible, approx_ratio, p_ground
+fr["tt"]         # the tensor train (tci=True), reusable: see solve_family(tt=...)
+```
+
+At p ≥ 2, `n_anchors=8` seeds the chain at 8 of the λ values only, which cuts the cost
+on long frontiers.
+
+### `solve_family` — Any parameterised family of QUBOs
+
+The general form of the frontier: a family Q(t₁, .., t_k) with k = 1, 2, 3, … parameters
+(a risk aversion, a penalty weight, a field strength, a blend of two problems…), solved
+at every point of a grid. Write `make_Q` with each tⱼ in [0, 1) and rescale inside it;
+points are snapped to a 2⁵ grid per parameter and visited neighbour to neighbour (a
+snake path), which the chain and the warm start rely on.
+
+```python
+from tciqaoa import solve_family, portfolio_qubo
+
+# two parameters: risk aversion in [0, 1) and budget penalty in [2, 10)
+make_Q2 = lambda t1, t2: portfolio_qubo(mu, sigma, k=4, risk_aversion=t1, penalty=2 + 8 * t2)
+
+res = solve_family(
+    make_Q       = make_Q2,  # (t_1, .., t_k) -> (n, n) QUBO matrix
+    p            = 1,
+    tci          = True,
+    n_params     = 2,        # k
+    nt           = 8,        # points per parameter axis (divides 32): 8 x 8 = 64 points
+    points       = None,     # or your own list of k-tuples, in neighbour order
+    n_anchors    = None,     # p >= 2: seed the chain at this many points only
+    tt           = None,     # a TT from an earlier call, to reuse
+    report       = False,    # True: add the read-out per point
+)
+
+res["params"]    # the points, as k-tuples
+res["angles"]    # optimal angles per point
+res["costs"]     # optimised <C> per point
+res["n_evals"]   # circuit runs, including the TT build: 31,728 (tci=False: 55,392)
+res["tt"]        # the depth-1 TT (tci=True), reusable at another depth or other points
+res["reports"]   # with report=True: best_sampled_x, approx_ratio, p_ground, ... per point
+```
+
+At p = 2, seeded at 8 of these 64 points, the same family costs 136,193 circuit runs
+with TCI and 60,213 without, and the results without TCI are slightly better (mean
+⟨C⟩ −0.8272 vs −0.8267): with 8 seeding points on a smooth 8 × 8 grid, coverage is
+good enough that TCI does not pay (see [Conclusions](#conclusions)).
+
+### Without QAOA: `solve_bits`
+
+Minimises xᵀQx directly over bitstrings, without a circuit, so n can be 80 or more.
+
+```python
+from tciqaoa import solve_bits
+
+res = solve_bits(Q, tci=True)    # TCI on exp(-beta E(x)) with staged beta (tci_minimize_bits)
+res = solve_bits(Q, tci=False)   # random-restart steepest-descent local search
+res = solve_bits([Q1, Q2, Q3, Q4], tci=True)   # a list (length 2^m): one TT for all
+
+res["x"], res["energy"], res["n_energy_evals"], res["tci"]
+```
+
+TCI here beats hybridq but loses to local search given the same time (benchmarks 2
+and 7), so `tci=False` is the better solver; `tci=True` is there to compare.
+
+### Command line
+
+```bash
+python -m tciqaoa Q.npy --p 2 --tci on --brute-force     # QUBO from .npy or a text file
+python -m tciqaoa Q.npy --mode bits --tci off            # bitstrings directly
+python -m tciqaoa --family my_family.py:make_Q --p 2 --nt 16 --anchors 8 --tci on
+python -m tciqaoa --family my_family.py:make_Q2 --n-params 2 --p 1 --nt 8 --tci off
+```
+
+`--family FILE.py:FUNC` names a function `FUNC(t_1, .., t_k) -> Q`.
+
+### Building blocks
+
+The interfaces wrap the lower-level functions listed under
+[What is in here](#what-is-in-here), for finer control: `optimize_tci` (TCI over the
+angles of one instance), `tci_sweep` and `sweep_chain` (with `use_tci`, `n_anchors`,
+`warm_start`), `sweep_library`, `tci_minimize_bits` and `tci_sweep_bits`. For example:
+
+```python
+from tciqaoa import QAOA, maxcut_qubo, random_graph, optimize_tci
+
+q = QAOA(maxcut_qubo(random_graph(12, 0.4, seed=3)), p=1)
+r = optimize_tci(q)                          # TCI over (gamma, beta)
+print(r["tt_max_rank"], r["pivot_error"], r["n_evals"])
+print(q.report(r["angles"]))                 # approx ratio, P(ground), best sampled x
+```
 
 ---
 
@@ -282,7 +549,7 @@ p ≥ 2 landscapes and the dense-QUBO Boltzmann tensors in this repo do not.
 | `SweepFamily`, `tci_sweep`, `solve_from_sweep`, `solve_lifted`, `sweep_library`, `sweep_chain` | **Sweeps** (`sweep_chain(family, ts, p)` runs the recommended pipeline at any depth): one TCI over (angles × a problem parameter t) for a whole family Q(t); read any slice's minima off the TT and polish them. `solve_lifted` uses the depth-1 sweep TT for a depth-p solve (INTERP lift); `sweep_library` solves a whole family at depth p with a shared basin library, seeded by a TCI sampler (default), random restarts or a p = 2 TCI sweep, and reports which start produced each optimum; `lower=` chains depths by lifting a p − 1 run's optima and library. |
 | `tci_minimize_bits` | **TCI route 2**: TCI (`xfacpy.TensorCI2`) on the n-leg Boltzmann tensor `F(x) = exp(-β(E(x) − E_ref))`, x ∈ {0,1}ⁿ (one leg per qubit, as in the QAOA register), with staged β (deeper layers / slower anneal) and a 1-flip polish. Never builds the 2ⁿ table, so it runs at n = 80+. Variables are ordered along the chain by the Fiedler vector of \|Q\|, since flattening order matters for tensor trains. |
 | `tci_sweep_bits` | Route 2 for a whole family: **one** TCI over (parameter bits × variable bits), e.g. a full efficient frontier over risk aversion, with cross-parameter reuse of the best configurations. |
-| `solve_qubo`, `solve_family`, `solve_bits` (`tciqaoa.solve`, `python -m tciqaoa`) | **Main entry points**, each with `tci=True/False`: one QUBO with QAOA, a family of QUBOs at many parameter points with QAOA, or the QUBO's bitstrings directly. See [Using it on your own QUBO](#using-it-on-your-own-qubo). |
+| `solve_qubo`, `solve_maxcut`, `solve_portfolio`, `solve_family`, `solve_bits` (`tciqaoa.solve`, `python -m tciqaoa`) | **Main entry points**, each with `tci=True/False`: one QUBO, MaxCut, a portfolio or efficient frontier, or any family of QUBOs at many parameter points, with QAOA; or the QUBO's bitstrings directly. See [Four problem interfaces](#four-problem-interfaces). |
 | `portfolio_data`, `portfolio_qubo` | hybridq's sector-structured portfolio generator, and Markowitz selection of k assets as a QUBO with the **linear** return −μᵀx and a budget penalty that keeps every local minimum feasible. |
 
 ### How the two TCI routes map onto QAOA
@@ -298,119 +565,6 @@ n-qubit register        ------------------------------->     n-leg tensor, local
 deeper p                ------------------------------->     larger β (staged)
 measurement shots       ------------------------------->     TCI pivots (full search)
 ```
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/Faluke-Aikebaier/tci-qaoa.git && cd tci-qaoa
-pip install -e .            # numpy, scipy
-# xfacpy is not on PyPI; build it:
-git clone https://github.com/tensor4all/xfac.git
-cmake -S xfac -B xfac/build -D CMAKE_BUILD_TYPE=Release -D XFAC_BUILD_PYTHON=ON
-cmake --build xfac/build -j 4
-export PYTHONPATH="$PWD/xfac/build/python:$PYTHONPATH"
-```
-
-The QAOA simulator and the two baseline angle optimisers work without xfacpy.
-
-## Quick start
-
-```python
-from tciqaoa import QAOA, maxcut_qubo, random_graph, optimize_tci, tci_minimize_bits
-
-Q = maxcut_qubo(random_graph(12, 0.4, seed=3))
-
-q = QAOA(Q, p=1)
-r = optimize_tci(q)                          # TCI over (gamma, beta)
-print(r["tt_max_rank"], r["pivot_error"], r["n_evals"])
-print(q.report(r["angles"]))                 # approx ratio, P(ground), best of 1000 shots
-
-r = tci_minimize_bits(Q)                     # TCI directly on exp(-beta E(x))
-print(r["energy"], r["n_energy_evals"], r["max_rank"])
-```
-
-## Using it on your own QUBO
-
-A QUBO here is a real n × n matrix Q; the problem is to minimise E(x) = xᵀQx over
-x ∈ {0, 1}ⁿ (linear terms go on the diagonal, since xᵢ² = xᵢ; Q need not be symmetric).
-QAOA simulates the circuit exactly, so the QAOA routes need n ≲ 22. There are three
-entry points, one per case where TCI works, and each takes `tci=True` or `tci=False`.
-`tci=False` runs the same pipeline with the TCI stage replaced by the baseline it was
-benchmarked against, so the two can be compared directly and the code runs without
-xfacpy.
-
-| case | call | `tci=True` | `tci=False` | which to use |
-|---|---|---|---|---|
-| one QUBO, QAOA depth p | `solve_qubo(Q, p, tci)` | p = 1: `optimize_tci` (TT over the angle box). p ≥ 2: the depth chain (p = 1 TT → p = 2 library seeded by the TCI sampler → INTERP lift) | p = 1: INTERP (5 restarts). p ≥ 2: the same chain, seeded by random restarts | `tci=False` is as good and cheaper on one instance |
-| a family Q(t₁, .., t_k), many points, QAOA depth p | `solve_family(make_Q, p, tci, n_params=k, nt=…)` | one p = 1 TT over (angles, t₁ .. t_k); p = 1: its slice minima polished at each point (plus the neighbour's optimum); p ≥ 2: the chain built on it | p = 1: INTERP at each point. p ≥ 2: the chain seeded by random restarts | `tci=True` from ~64 points on (1.8× cheaper at p = 1), and at p ≥ 2 when seeding few points (`n_anchors`) |
-| the bitstrings directly (no QAOA) | `solve_bits(Q, tci)`; Q may be a list (a frontier) | `tci_minimize_bits` (TCI on exp(−βE(x)), staged β); for a list, `tci_sweep_bits` | random-restart local search | `tci=False` (it wins when time-matched); `tci=True` runs to n = 80+ and beats hybridq |
-
-Every result carries `n_evals` (circuit runs) or `n_energy_evals`, so the cost of TCI
-on and off can be compared directly.
-
-The entry points build the sweep TT with `angle_pivots=4`: the build also starts from
-4 × 4 points spread over the angle box. Without them, the build can converge early
-around one basin. On the portfolio example below with the default budget penalty, it
-stopped at rank 4 after 224 runs and missed the optimum at every point. With them it
-reaches rank 11 after 1.9k runs and matches INTERP at all 32 points, for 2.1× fewer
-circuit runs in total (13.6k vs 28.5k). The benchmarks were run without this option
-(`tci_sweep`'s default, `angle_pivots=0`).
-
-**One QUBO:**
-
-```python
-import numpy as np
-from tciqaoa import solve_qubo, solve_bits, random_qubo
-
-Q = random_qubo(12, seed=3)                  # or your own n x n matrix
-
-r = solve_qubo(Q, p=2, tci=True)             # tci=False: the same chain without TCI
-print(r["angles"], r["n_evals"])             # optimal (gamma_1..gamma_p, beta_1..beta_p)
-print(r["report"])                           # approx ratio, P(ground), best sampled x
-
-b = solve_bits(Q, tci=True)                  # minimise x^T Q x directly
-print(b["x"], b["energy"])
-```
-
-**A family of QUBOs** (a parameter sweep: risk aversion, a penalty weight, a field…).
-Write `make_Q` with every parameter in [0, 1) and rescale inside it; the points are
-snapped to a 2⁵ grid per parameter. Points are visited neighbour to neighbour (a snake
-path on a grid), which the chain and the warm start rely on.
-
-```python
-from tciqaoa import solve_family, portfolio_data, portfolio_qubo
-
-mu, sigma = portfolio_data(10, seed=0)
-make_Q = lambda t: portfolio_qubo(mu, sigma, k=4, risk_aversion=0.2 + 6 * t)
-
-r = solve_family(make_Q, p=1, tci=True, nt=32)          # 32 values of t, one TT
-print(r["params"][:3], r["costs"][:3], r["n_evals"])
-
-r2 = solve_family(make_Q, p=2, tci=True, nt=32, n_anchors=8, tt=r["tt"])  # reuse the TT
-
-make_Q2 = lambda t1, t2: portfolio_qubo(mu, sigma, k=4, risk_aversion=0.2 + 6 * t1,
-                                        penalty=0.5 + 3 * t2)
-r3 = solve_family(make_Q2, p=2, tci=True, n_params=2, nt=8, n_anchors=16)  # 8 x 8 grid
-```
-
-`points=[...]` replaces the grid with your own points (floats, or k-tuples), in a
-neighbour-to-neighbour order. `report=True` adds the physical figures of merit per point.
-
-**Command line** (`python -m tciqaoa --help`): the QUBO comes from a `.npy` or text
-file, and a family from a Python function `FUNC(t_1, .., t_k) -> Q`.
-
-```bash
-python -m tciqaoa Q.npy --p 2 --tci on --brute-force
-python -m tciqaoa Q.npy --mode bits --tci off
-python -m tciqaoa --family my_family.py:make_Q --p 2 --nt 16 --anchors 8 --tci on
-python -m tciqaoa --family my_family.py:make_Q2 --n-params 2 --p 1 --nt 8 --tci off
-```
-
-For finer control, the building blocks are listed under [What is in here](#what-is-in-here):
-`optimize_tci`, `tci_sweep`, `sweep_chain` (with `use_tci`, `n_anchors`, `warm_start`),
-`sweep_library`, `tci_minimize_bits` and `tci_sweep_bits`.
 
 ---
 
@@ -1724,7 +1878,7 @@ afford only a few seeding points (`n_anchors`); otherwise random seeds
 ## Tests
 
 ```bash
-pytest -q          # 27 tests; the 14 TCI tests are skipped if xfacpy is not importable
+pytest -q          # 28 tests; the 15 TCI tests are skipped if xfacpy is not importable
 ```
 
 ## References

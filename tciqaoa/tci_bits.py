@@ -25,7 +25,7 @@ import numpy as np
 
 from .problems import symmetrize, local_search
 
-__all__ = ["variable_order", "tci_minimize_bits"]
+__all__ = ["variable_order", "tci_minimize_bits", "tci_sweep_bits"]
 
 
 def variable_order(Q, order="spectral"):
@@ -46,7 +46,8 @@ def variable_order(Q, order="spectral"):
 
 
 def tci_minimize_bits(Q, betas=(0.5, 1.0, 2.0, 4.0), bond_dim=20, sweeps_per_beta=4,
-                      order="spectral", n_polish=20, n_seeds=4, seed=0, verbose=False):
+                      order="spectral", n_polish=20, n_seeds=4, seed=0, verbose=False,
+                      full_pivot=True):
     """Minimise x^T Q x over {0,1}^n with staged-beta TCI on exp(-beta*(E - E_ref)).
 
     beta is given in units of 1/(typical single-flip energy change), so the same
@@ -93,7 +94,7 @@ def tci_minimize_bits(Q, betas=(0.5, 1.0, 2.0, 4.0), bond_dim=20, sweeps_per_bet
         param = xfacpy.TensorCI2Param()
         param.bondDim = bond_dim
         param.reltol = 1e-12
-        param.fullPiv = False
+        param.fullPiv = full_pivot      # deterministic (rook search is history-dependent)
         param.nRookIter = 5
         param.pivot1 = [int(v) for v in best_x]
         ci = xfacpy.TensorCI2(f, [2] * n, param)
@@ -125,3 +126,104 @@ def tci_minimize_bits(Q, betas=(0.5, 1.0, 2.0, 4.0), bond_dim=20, sweeps_per_bet
         "max_rank": int(max_rank),
         "history": history,
     }
+
+
+def tci_sweep_bits(Q_list, betas=(0.5, 1.0, 2.0, 4.0), bond_dim=20, sweeps_per_beta=4,
+                   order="spectral", n_polish=10, seed=0, full_pivot=True):
+    """One TCI for a whole family of QUBOs Q(t) (e.g. an efficient frontier over lambda).
+
+    The tensor has R_t = log2(len(Q_list)) legs for t, followed by the n variable legs:
+
+        F(t, x) = exp(-beta * (E_t(x) - E_ref(t)) / unit(t))
+
+    Each slice is normalised by its own best-known energy and energy unit, so every t
+    gets the same weight.  After each beta stage, every t polishes (1-flip local
+    search) its ``n_polish`` lowest cached configurations plus the current best of its
+    two neighbours in t; finally every t is tried from the best of every other t.
+    Returns dict(x: list per t, energy: array per t, n_energy_evals, max_rank).
+    """
+    import xfacpy
+
+    T = len(Q_list)
+    R = int(round(np.log2(T)))
+    assert 2 ** R == T, "len(Q_list) must be a power of 2"
+    Qs = [symmetrize(Q) for Q in Q_list]
+    n = Qs[0].shape[0]
+    rng = np.random.default_rng(seed)
+    perm = variable_order(sum(np.abs(Q) for Q in Qs), order)
+    Qp = [Q[np.ix_(perm, perm)] for Q in Qs]
+    units = []
+    for Q in Qp:
+        u = float(np.sqrt(np.mean((2 * Q @ rng.integers(0, 2, n) + np.diag(Q)) ** 2)))
+        units.append(u or 1.0)
+
+    cache = {}
+    extra = [0]
+
+    def energy(bits):
+        key = tuple(bits)
+        e = cache.get(key)
+        if e is None:
+            t = int("".join(str(int(b)) for b in bits[:R]), 2)
+            x = np.asarray(bits[R:], dtype=float)
+            e = float(x @ Qp[t] @ x)
+            cache[key] = e
+        return e
+
+    def tbits(t):
+        return [int(c) for c in format(t, f"0{R}b")]
+
+    def polish(t, x):
+        y, e, ev = local_search(np.asarray(x), Qp[t])
+        extra[0] += ev // n + 1
+        return y.astype(int), e
+
+    best = [polish(t, rng.integers(0, 2, n)) for t in range(T)]     # (x, E) per t
+    max_rank = 0
+    for beta in betas:
+        ref = [b[1] for b in best]
+
+        def f(bits, beta=beta, ref=ref):
+            t = int("".join(str(int(b)) for b in bits[:R]), 2)
+            return float(np.exp(-beta * (energy(bits) - ref[t]) / units[t]))
+
+        param = xfacpy.TensorCI2Param()
+        param.bondDim = bond_dim
+        param.reltol = 1e-12
+        param.fullPiv = full_pivot      # deterministic (rook search is history-dependent)
+        param.nRookIter = 5
+        param.pivot1 = tbits(0) + [int(v) for v in best[0][0]]
+        ci = xfacpy.TensorCI2(f, [2] * (R + n), param)
+        ci.addPivotsAllBonds([tbits(t) + [int(v) for v in best[t][0]] for t in range(1, T)])
+        for _ in range(sweeps_per_beta):
+            ci.iterate(1, 2)
+        max_rank = max(max_rank, max(c.shape[2] for c in ci.tt.core[:-1]))
+        by_t = [[] for _ in range(T)]
+        for bits, e in cache.items():
+            by_t[int("".join(str(b) for b in bits[:R]), 2)].append((e, bits[R:]))
+        new = []
+        for t in range(T):
+            cands = [np.array(b) for _, b in sorted(by_t[t])[:n_polish]]
+            cands += [best[s][0] for s in (t - 1, t + 1) if 0 <= s < T]
+            bt = best[t]
+            for x0 in cands:
+                y, e = polish(t, x0)
+                if e < bt[1] - 1e-12:
+                    bt = (y, e)
+            new.append(bt)
+        best = new
+    # reuse across the family: start every t from every other t's best
+    for t in range(T):
+        for s in range(T):
+            if s != t and not np.array_equal(best[s][0], best[t][0]):
+                y, e = polish(t, best[s][0])
+                if e < best[t][1] - 1e-12:
+                    best[t] = (y, e)
+    xs = []
+    for y, _ in best:
+        x = np.empty(n)
+        x[perm] = y
+        xs.append(x)
+    return {"x": xs, "energy": np.array([float(x @ Q @ x) for x, Q in zip(xs, Qs)]),
+            "n_energy_evals": len(cache) + extra[0], "n_tci_evals": len(cache),
+            "max_rank": int(max_rank)}

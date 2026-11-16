@@ -11,7 +11,7 @@ import numpy as np
 __all__ = [
     "symmetrize", "qubo_energy", "all_energies", "brute_force",
     "maxcut_qubo", "cut_value", "random_qubo", "random_graph",
-    "local_search",
+    "local_search", "portfolio_data", "portfolio_qubo",
 ]
 
 
@@ -102,3 +102,39 @@ def local_search(x, Q, max_passes=100):
         Qx += Qs[:, i] * delta[i]
         E += float(dE[i])
     return x, E, evals
+
+
+def portfolio_data(n, seed=42):
+    """hybridq's ``examples.make_portfolio_data``: n assets with sector structure.
+
+    Covariance = F F^T (n // 7 sector factors) + idiosyncratic diagonal; returns
+    (mu, sigma) with expected returns mu ~ U(0.05, 0.20).
+    """
+    rng = np.random.default_rng(seed)
+    n_sec = max(2, n // 7)
+    F = rng.standard_normal((n, n_sec))
+    sigma = F @ F.T + np.diag(np.abs(rng.standard_normal(n)) * 0.05)
+    sigma += np.eye(n) * 0.02
+    mu = rng.uniform(0.05, 0.20, n)
+    return mu, sigma
+
+
+def portfolio_qubo(mu, sigma, k, risk_aversion=1.0, penalty=None):
+    """Markowitz selection of exactly k assets as a QUBO.
+
+    E(x) = lambda x^T Sigma x - mu_n^T x + A (sum x - k)^2 - A k^2,  mu_n = mu / max|mu|.
+    For binary x the linear return is the diagonal term -diag(mu_n) (x_i^2 = x_i).
+    (hybridq's ``solve_portfolio`` uses -mu_n mu_n^T, i.e. the *squared* return.)
+
+    The default penalty A = 2 (lambda max_i sum_j |Sigma_ij| + 1) exceeds the largest
+    objective change of a single flip, so every 1-flip local minimum, and hence the
+    optimum, holds exactly k assets.
+    """
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    n = len(mu)
+    mu_n = mu / max(np.abs(mu).max(), 1e-12)
+    if penalty is None:
+        penalty = 2.0 * (risk_aversion * np.abs(sigma).sum(1).max() + 1.0)
+    P = np.ones((n, n)) - 2 * k * np.eye(n)          # (sum x - k)^2 - k^2
+    return risk_aversion * sigma - np.diag(mu_n) + penalty * P

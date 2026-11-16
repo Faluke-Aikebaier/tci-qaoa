@@ -1,5 +1,9 @@
 """
-Benchmark 2: solution quality on QUBO / MaxCut instances, n = 16 .. 80.
+Benchmark 2: solution quality on QUBO / MaxCut / portfolio instances, n = 16 .. 80.
+
+TCI-bits applies TCI directly to the objective E(x) (no QAOA).  The portfolio kind is
+Markowitz selection of k = n // 4 assets (risk aversion 1, linear return, budget
+penalty; ``tciqaoa.portfolio_qubo``) on hybridq's own ``make_portfolio_data``.
 
 Compares, on identical instances (hybridq's own generators):
   hybridq-SB    hybridq.solve_qubo(core='sb')   (simulated bifurcation)
@@ -26,7 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tciqaoa.problems import (brute_force, maxcut_qubo, random_graph, random_qubo,
-                              local_search, qubo_energy)
+                              local_search, qubo_energy, portfolio_data, portfolio_qubo)
 from tciqaoa.tci_bits import tci_minimize_bits
 
 HYB = os.environ.get("HYBRIDQ_PATH")
@@ -54,8 +58,13 @@ def ls_multistart(Q, n_starts, seed, time_budget=None):
 
 
 def run_instance(kind, n, seed, ls_starts):
-    Q = maxcut_qubo(random_graph(n, 0.4, seed=seed)) if kind == "maxcut" \
-        else random_qubo(n, 0.5, seed=seed)
+    if kind == "maxcut":
+        Q = maxcut_qubo(random_graph(n, 0.4, seed=seed))
+    elif kind == "qubo":
+        Q = random_qubo(n, 0.5, seed=seed)
+    else:
+        mu, sigma = portfolio_data(n, seed=seed)
+        Q = portfolio_qubo(mu, sigma, n // 4)
     out = {}
 
     def timed(name, fn):
@@ -90,10 +99,11 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="+", default=[16, 20, 30, 50, 80])
     ap.add_argument("--seeds", type=int, default=10)
     ap.add_argument("--ls-starts", type=int, default=100)
+    ap.add_argument("--kinds", nargs="+", default=["maxcut", "qubo"])
     ap.add_argument("--out", default="results/solvers.json")
     a = ap.parse_args()
     rows = []
-    for kind in ["maxcut", "qubo"]:
+    for kind in a.kinds:
         for n in a.sizes:
             for s in range(a.seeds):
                 r = run_instance(kind, n, s, a.ls_starts)

@@ -9,6 +9,10 @@ not a classical analogue.  Practical up to n ~ 22 on a laptop.
 
 The cost is shifted and scaled, C = (E - mean(E)) / std(E), so one gamma range fits
 every instance; the scaling changes only the units of gamma, never the physics.
+
+``shots`` (optional) turns ``cost`` into the estimate a real device gives: the mean of
+C over ``shots`` bitstrings sampled from |psi|^2 (one multinomial draw), so every
+optimiser sees shot noise.  ``exact_cost`` always gives the exact <C> (for scoring).
 """
 
 import numpy as np
@@ -19,7 +23,7 @@ __all__ = ["QAOA"]
 
 
 class QAOA:
-    def __init__(self, Q, p=1, energies=None):
+    def __init__(self, Q, p=1, energies=None, shots=None, rng=None):
         self.Q = symmetrize(Q)
         self.n = self.Q.shape[0]
         self.p = int(p)
@@ -31,6 +35,8 @@ class QAOA:
         self.C = (self.E - self.mean) / self.std
         self.gs_mask = np.isclose(self.E, self.E_min, atol=1e-9)
         self.n_evals = 0          # number of circuit expectation-value evaluations
+        self.shots = shots
+        self.rng = np.random.default_rng(rng) if shots else None
 
     # ------------------------------------------------------------------ circuit
     def state(self, gammas, betas):
@@ -59,6 +65,14 @@ class QAOA:
     def cost(self, angles):
         """<C> in normalised units (what the optimiser minimises). Counts one evaluation."""
         self.n_evals += 1
+        P = self.probs(angles)
+        if not self.shots:
+            return float(np.dot(P, self.C))
+        counts = self.rng.multinomial(self.shots, P / P.sum())
+        return float(np.dot(counts, self.C)) / self.shots
+
+    def exact_cost(self, angles):
+        """Exact <C> (normalised units), whatever ``shots`` is. Not counted."""
         return float(np.dot(self.probs(angles), self.C))
 
     def report(self, angles, shots=1000, rng=None):
